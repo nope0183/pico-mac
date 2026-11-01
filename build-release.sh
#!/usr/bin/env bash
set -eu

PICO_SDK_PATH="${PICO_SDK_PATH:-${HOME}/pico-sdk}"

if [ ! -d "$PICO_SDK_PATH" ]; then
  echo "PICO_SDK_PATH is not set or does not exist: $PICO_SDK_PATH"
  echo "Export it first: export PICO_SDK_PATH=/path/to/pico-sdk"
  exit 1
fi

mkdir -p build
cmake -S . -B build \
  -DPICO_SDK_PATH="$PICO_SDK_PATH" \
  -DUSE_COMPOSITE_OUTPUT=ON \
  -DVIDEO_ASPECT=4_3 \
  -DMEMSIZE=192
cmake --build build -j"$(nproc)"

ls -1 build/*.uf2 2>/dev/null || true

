@@ -1,0 +1,97 @@
+# pico-mac
+
+Fork-style Raspberry Pi Pico Mac emulator with RCA composite output and 4:3 aspect ratio support for deploy/test builds.
+
+This fork keeps the original Macintosh emulator and adds a `composite` output mode intended for RCA/TV use with a 4:3 frame. The original VGA path remains available, but the recommended board configuration for a TV/analog monitor is:
+
+- single RCA composite video line
+- 4:3 centered framebuffer
+- black borders instead of stretching the Mac image
+- USB keyboard/mouse attached via OTG adapter
+
+## Build options
+
+The project supports the following build flags:
+
+- `-DUSE_COMPOSITE_OUTPUT=ON` — switch from VGA-style output to composite-friendly output mode.
+- `-DVIDEO_ASPECT=4_3` — keep the image at a 4:3 aspect ratio.
+- `-DUSE_VGA_RES=ON` — optional 640x480 VGA mode.
+- `-DMEMSIZE=128|192|208` — increase RAM when needed.
+- `-DUSE_SD=ON` — enable SD-card drive support.
+- `-DVIDEO_PIN=<gpio>` — move the base video pin if needed.
+
+Example:
+
+```bash
+mkdir -p build
+cd build
+cmake -DPICO_SDK_PATH=/path/to/pico-sdk \
+      -DUSE_COMPOSITE_OUTPUT=ON \
+      -DVIDEO_ASPECT=4_3 \
+      -DMEMSIZE=192 \
+      ..
+make -j$(nproc)
+```
+
+This generates a `.uf2` file in `build/` that you can drag to a Pico in BOOTSEL mode.
+
+## Wiring for RCA composite
+
+For a composite TV/monitor, wire the video output as follows:
+
+- Pico output pin (`GPIO_VID_BASE`, default 18) -> 220R–470R resistor -> RCA center pin
+- RCA shield -> Pico GND
+- optional 75R termination / RC filter depending on TV input quality
+
+Important: this is still a simple analog luma output and should be treated as a compatibility-focused board-level hack, not a full NTSC/PAL encoder. It is intended to work with modern composite-compatible TVs and low-cost analog monitors that accept a monochrome/gray signal.
+
+## Build and release workflow
+
+To make a repeatable release build:
+
+```bash
+./build-release.sh
+```
+
+The release script creates a local `build/` directory and packages the UF2 output for distribution.
+
+Then, in GitHub:
+
+1. open the repository page
+2. click Releases
+3. create a new draft or published release
+4. upload the UF2 from `build/firmware.uf2` or `build/pico-mac.uf2`
+5. include a short note about RCA/4:3 output compatibility
+
+## Notes
+
+- The upstream project is VGA-centric and originally expects a resistor-based VGA DAC.
+- For true composite video on a CRT/TV, a dedicated sync encoder or a small analog conditioning circuit may still be required.
+- This fork is meant as a deploy/test configuration for a single-pin analog output and a 4:3 image frame.
+
+## Original upstream repo
+
+- https://github.com/evansm7/pico-mac
+
+## Original hardware notes
+
+The upstream project uses a resistor-based VGA output and a PIO-driven scanout path. The RCA 4:3 fork keeps the same framebuffer logic but moves the target to a simpler composite-friendly display mode.
+
+## Firmware flash steps
+
+```bash
+# hold BOOTSEL on Pico
+# drag and drop the generated UF2
+```
+
+After flashing:
+
+- connect USB keyboard or mouse
+- power the Pico from 5V
+- connect RCA display and confirm the centered 4:3 frame appears
+- if needed, adjust the resistor value from 220R to 470R for brightness/contrast
+
+## License
+
+MIT License, matching the original upstream project.
+
