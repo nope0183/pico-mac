@@ -1,0 +1,197 @@
+src/video.c
+/* Video output:
+ * Composite/RCA 4:3 mode for Pico Mac.
+ */
+
+#include <stdio.h>
+#include <inttypes.h>
+#include <string.h>
+#include "hardware/clocks.h"
+#include "hardware/dma.h"
+#include "hardware/gpio.h"
+#include "hardware/structs/padsbank0.h"
+#include "pio_video.pio.h"
+
+#include "hw.h"
+
+#ifndef VIDEO_OUTPUT_MODE
+#define VIDEO_OUTPUT_MODE 0
+#endif
+
+#define VIDEO_MODE_VGA 0
+#define VIDEO_MODE_COMPOSITE 1
+
+#define VIDEO_PCLK_MULT         (2.5*2)
+#define VIDEO_HSW               96
+#define VIDEO_HBP               48
+#define VIDEO_HRES              640
+#define VIDEO_HFP               16
+#define VIDEO_H_TOTAL_NOSYNC    (VIDEO_HBP + VIDEO_HRES + VIDEO_HFP)
+#define VIDEO_VSW               2
+#define VIDEO_VBP               33
+#define VIDEO_VRES              480
+#define VIDEO_VFP               10
+#define VIDEO_V_TOTAL           (VIDEO_VSW + VIDEO_VBP + VIDEO_VRES + VIDEO_VFP)
+#define VIDEO_V_VIS_START       (VIDEO_VSW + VIDEO_VBP)
+#define VIDEO_V_VIS_END         (VIDEO_V_VIS_START + VIDEO_VRES)
+#define VIDEO_FB_HRES           DISP_WIDTH
+#define VIDEO_FB_VRES           DISP_HEIGHT
+#define VIDEO_FB_V_VIS_START    (VIDEO_V_VIS_START + ((VIDEO_VRES - VIDEO_FB_VRES)/2))
+#define VIDEO_FB_V_VIS_END      (VIDEO_FB_V_VIS_START + VIDEO_FB_VRES)
+#define VIDEO_VISIBLE_WPL       (VIDEO_FB_HRES / 32)
+
+#if (VIDEO_HRES & 31)
+#error "VIDEO_HRES: must be a multiple of 32b!"
+#endif
+
+static uint32_t video_null[VIDEO_VISIBLE_WPL];
+static uint32_t *video_framebuffer;
+static uint32_t video_dma_cfg[4];
+static uint8_t video_dmach_tx;
+static uint8_t video_dmach_descr_cfg;
+static uint8_t video_dmach_descr_data;
+
+typedef struct {
+        const void *raddr;
+        void *waddr;
+        uint32_t count;
+        uint32_t ctrl;
+} dma_descr_t;
+
+static dma_descr_t video_dmadescr_cfg;
+static dma_descr_t video_dmadescr_data;
+static volatile unsigned int video_current_y = 0;
+
+static int video_get_visible_y(unsigned int y) {
+        if ((y >= VIDEO_FB_V_VIS_START) && (y < VIDEO_FB_V_VIS_END)) {
+                return y - VIDEO_FB_V_VIS_START;
+        }
+        return -1;
+}
+
+static const uint32_t *video_line_addr(unsigned int y) {
+        int vy = video_get_visible_y(y);
+        if (vy >= 0)
+                return (const uint32_t *)&video_framebuffer[vy * VIDEO_VISIBLE_WPL];
+        return (const uint32_t *)video_null;
+}
+
+static const uint32_t *video_cfg_addr(unsigned int y) {
+        return &video_dma_cfg[(y < VIDEO_VSW) ? 0 : 2];
+}
+
+static void video_dma_prep_new() {
+        dma_hw->ch[video_dmach_descr_cfg].read_addr = (uintptr_t)&video_dmadescr_cfg;
+        dma_hw->ch[video_dmach_descr_cfg].transfer_count = 4;
+        dma_hw->ch[video_dmach_descr_data].read_addr = (uintptr_t)&video_dmadescr_data;
+        dma_hw->ch[video_dmach_descr_data].transfer_count = 4;
+
+        video_dmadescr_cfg.raddr = video_cfg_addr(video_current_y);
+        video_dmadescr_data.raddr = video_line_addr(video_current_y);
+
+        if (++video_current_y >= VIDEO_V_TOTAL)
+                video_current_y = 0;
+}
+
+static void video_dma_irq() {
+        if (dma_channel_get_irq0_status(video_dmach_descr_data)) {
+                dma_channel_acknowledge_irq0(video_dmach_descr_data);
+                video_dma_prep_new();
+        }
+}
+
+static void video_prep_buffer() {
+        memset(video_null, 0xff, VIDEO_VISIBLE_WPL * 4);
+
+        unsigned int porch_padding = (VIDEO_HRES - VIDEO_FB_HRES)/2;
+        uint32_t timing = ((VIDEO_HSW - 1) << 23) |
+                ((VIDEO_HBP + porch_padding - 3) << 15) |
+                ((VIDEO_HFP + porch_padding - 4) << 7);
+        video_dma_cfg[0] = timing | 0x80000000;
+        video_dma_cfg[1] = VIDEO_FB_HRES - 1;
+        video_dma_cfg[2] = timing;
+        video_dma_cfg[3] = VIDEO_FB_HRES - 1;
+}
+
+static void video_init_dma() {
+        video_dmach_tx = dma_claim_unused_channel(true);
+        video_dmach_descr_cfg = dma_claim_unused_channel(true);
+        video_dmach_descr_data = dma_claim_unused_channel(true);
+
+        dma_channel_config dc_tx_c = dma_channel_get_default_config(video_dmach_tx);
+        channel_config_set_dreq(&dc_tx_c, DREQ_PIO0_TX0);
+        channel_config_set_transfer_data_size(&dc_tx_c, DMA_SIZE_32);
+        channel_config_set_read_increment(&dc_tx_c, true);
+        channel_config_set_write_increment(&dc_tx_c, false);
+        channel_config_set_bswap(&dc_tx_c, false);
+        channel_config_set_chain_to(&dc_tx_c, video_dmach_descr_data);
+        video_dmadescr_cfg.raddr = NULL;
+        video_dmadescr_cfg.waddr = (void *)&pio0_hw->txf[0];
+        video_dmadescr_cfg.count = 2;
+        video_dmadescr_cfg.ctrl = dc_tx_c.ctrl;
+
+        dma_channel_config dc_tx_d = dma_channel_get_default_config(video_dmach_tx);
+        channel_config_set_dreq(&dc_tx_d, DREQ_PIO0_TX0);
+        channel_config_set_transfer_data_size(&dc_tx_d, DMA_SIZE_32);
+        channel_config_set_read_increment(&dc_tx_d, true);
+        channel_config_set_write_increment(&dc_tx_d, false);
+        channel_config_set_bswap(&dc_tx_d, true);
+        channel_config_set_chain_to(&dc_tx_d, video_dmach_descr_cfg);
+        video_dmadescr_data.raddr = NULL;
+        video_dmadescr_data.waddr = (void *)&pio0_hw->txf[0];
+        video_dmadescr_data.count = VIDEO_VISIBLE_WPL;
+        video_dmadescr_data.ctrl = dc_tx_d.ctrl;
+
+        dma_channel_config dcfg = dma_channel_get_default_config(video_dmach_descr_cfg);
+        channel_config_set_transfer_data_size(&dcfg, DMA_SIZE_32);
+        channel_config_set_read_increment(&dcfg, true);
+        channel_config_set_write_increment(&dcfg, true);
+        channel_config_set_ring(&dcfg, true, 4);
+        dma_channel_configure(video_dmach_descr_cfg, &dcfg,
+                              &dma_hw->ch[video_dmach_tx].read_addr,
+                              &video_dmadescr_cfg,
+                              4,
+                              false);
+
+        dma_channel_config ddata = dma_channel_get_default_config(video_dmach_descr_data);
+        channel_config_set_transfer_data_size(&ddata, DMA_SIZE_32);
+        channel_config_set_read_increment(&ddata, true);
+        channel_config_set_write_increment(&ddata, true);
+        channel_config_set_ring(&ddata, true, 4);
+        dma_channel_set_irq0_enabled(video_dmach_descr_data, true);
+        dma_channel_configure(video_dmach_descr_data, &ddata,
+                              &dma_hw->ch[video_dmach_tx].read_addr,
+                              &video_dmadescr_data,
+                              4,
+                              false);
+}
+
+void video_init(uint32_t *framebuffer) {
+        printf("Video init (composite 4:3 mode)\n");
+
+        pio_video_program_init(pio0, 0,
+                               pio_add_program(pio0, &pio_video_program),
+                               GPIO_VID_DATA,
+                               VIDEO_PCLK_MULT);
+
+        gpio_set_outover(GPIO_VID_HS, GPIO_OVERRIDE_INVERT);
+        gpio_set_outover(GPIO_VID_VS, GPIO_OVERRIDE_INVERT);
+        gpio_set_outover(GPIO_VID_DATA, GPIO_OVERRIDE_INVERT);
+        hw_write_masked(&padsbank0_hw->io[GPIO_VID_DATA],
+                        PADS_BANK0_GPIO0_DRIVE_VALUE_12MA << PADS_BANK0_GPIO0_DRIVE_LSB,
+                        PADS_BANK0_GPIO0_DRIVE_BITS);
+
+        irq_set_exclusive_handler(DMA_IRQ_0, video_dma_irq);
+        irq_set_enabled(DMA_IRQ_0, true);
+
+        video_init_dma();
+        video_current_y = 0;
+        video_framebuffer = framebuffer;
+        video_prep_buffer();
+
+        video_dma_prep_new();
+        dma_channel_start(video_dmach_descr_cfg);
+}
+
+
+

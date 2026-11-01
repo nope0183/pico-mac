@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -eu
+
+PICO_SDK_PATH="${PICO_SDK_PATH:-${HOME}/pico-sdk}"
+
+if [ ! -d "$PICO_SDK_PATH" ]; then
+  echo "PICO_SDK_PATH is not set or does not exist: $PICO_SDK_PATH"
+  echo "Export it first: export PICO_SDK_PATH=/path/to/pico-sdk"
+  exit 1
+fi
+
+mkdir -p build
+cmake -S . -B build \
+  -DPICO_SDK_PATH="$PICO_SDK_PATH" \
+  -DUSE_COMPOSITE_OUTPUT=ON \
+  -DVIDEO_ASPECT=4_3 \
+  -DMEMSIZE=192
+cmake --build build -j"$(nproc)"
+
+ls -1 build/*.uf2 2>/dev/null || true
+
