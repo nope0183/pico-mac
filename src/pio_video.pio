@@ -1,0 +1,98 @@
+; PIO video output:
+; This scans out video lines, characteristically some number of bits per pixel,
+; a pixel clock, and timing signals HSync, VSync (in future, DE too).
+;
+; Copyright 2024 Matt Evans
+;
+; Permission is hereby granted, free of charge, to any person
+; obtaining a copy of this software and associated documentation files
+; (the "Software"), to deal in the Software without restriction,
+; including without limitation the rights to use, copy, modify, merge,
+; publish, distribute, sublicense, and/or sell copies of the Software,
+; and to permit persons to whom the Software is furnished to do so,
+; subject to the following conditions:
+;
+; The above copyright notice and this permission notice shall be
+; included in all copies or substantial portions of the Software.
+;
+; THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+; EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+; MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+; NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+; BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+; ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+; CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+; SOFTWARE.
+;
+;
+; Composite video (CVBS) scan-out engine.
+;
+; Two GPIOs form a 2-bit resistor DAC (see README):
+;    base+0: VIDEO  (data, 1 = white after the GPIO inversion done in video.c)
+;    base+1: SYNC   (0 = sync tip, 1 = blanking/video level)
+;
+; VIDEO is driven by OUT/MOV (pixel data), SYNC by the side-set bit.
+;
+; Every "line" (a full video line, or a half-line slot in the vertical
+; sync interval) is described by four 32-bit config words followed by
+; N*32 pixels of data, all streamed through the TX FIFO:
+;
+;   w0: SYNC  width in pixels - 1     (SYNC low)
+;   w1: BP    delay,  see below
+;   w2: number of pixels - 1          (multiple of 32 pixels in the stream)
+;   w3: FP    delay,  see below
+;
+; One pixel = 2 PIO cycles.  Cycle accounting (px = 2 cycles):
+;
+;     outs(1px) | sync(S+1) | bp(B+1) | outs(1px) | pix(P+1) | mov+nop(1px) | fp(F+1)
+;
+;   line length      = S+B+P+F + 7           px
+;   first pixel is at (S+1) + (B+1) + 1      px after SYNC falling edge
+;
+; video.c turns timing in pixels into S/B/P/F.
+
+.program pio_video
+.side_set 1                     ; side-set bit = SYNC pin level
+
+.wrap_target
+        out     x, 32           side 1          ; S
+        out     y, 32           side 1          ; B
+sync_loop:
+        nop                     side 0
+        jmp     x--, sync_loop  side 0
+bp_loop:
+        nop                     side 1
+        jmp     y--, bp_loop    side 1
+        out     x, 32           side 1          ; P
+        out     y, 32           side 1          ; F
+pix_loop:                                       ; first OUT autopulls data
+        out     pins, 1         side 1
+        jmp     x--, pix_loop   side 1
+        mov     pins, !null     side 1          ; back to blanking level
+        nop                     side 1
+fp_loop:
+        nop                     side 1
+        jmp     y--, fp_loop    side 1
+.wrap
+
+
+% c-sdk {
+static inline void pio_video_program_init(PIO pio, uint sm, uint offset,
+                                          uint video_pin /* then SYNC */,
+                                          float clk_div) {
+        uint sync_pin = video_pin + 1;
+        pio_gpio_init(pio, video_pin);
+        pio_gpio_init(pio, sync_pin);
+        pio_sm_set_consecutive_pindirs(pio, sm, video_pin, 2, true /* out */);
+
+        pio_sm_config c = pio_video_program_get_default_config(offset);
+        sm_config_set_out_pins(&c, video_pin, 1);
+        sm_config_set_sideset_pins(&c, sync_pin);
+        sm_config_set_out_shift(&c, false /* MSB first */, true /* autopull */, 32);
+        sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+        sm_config_set_clkdiv(&c, clk_div);
+
+        pio_sm_init(pio, sm, offset, &c);
+        pio_sm_set_enabled(pio, sm, true);
+}
+%}

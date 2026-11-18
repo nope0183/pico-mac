@@ -53,3 +53,19 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# CMake / Pico SDK build output
+/build/
+/cmake-build-*/
+/pico-sdk/
+/CMakeFiles/
+/CMakeCache.txt
+/compile_commands.json
+*.uf2
+*.bin
+
+# Locally generated firmware data (do not commit ROMs or disk images)
+/incbin/umac-rom.h
+/incbin/umac-disc.h
+/rom.bin
+/disc.bin
